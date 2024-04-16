@@ -45,8 +45,8 @@ label_list=['O',
             'I-Tx_RiskMed',
             'B-Tx_RiskPro',
             'I-Tx_RiskPro']
-tag_index_map={tag:idx for idx,tag in enumerate(label_list)}
-
+label2id={tag:idx for idx,tag in enumerate(label_list)}
+id2label={value:key for key,value in label2id.items()}
 
 dataset=[]
 grouped_data_tokens=df.groupby('Sentence #')['token'].apply(list).reset_index()
@@ -55,10 +55,16 @@ for idx in range(len(grouped_data_tokens)):
     temp_dict={
         'id':idx,
         'tokens':grouped_data_tokens['token'][idx],
-        'ner_tags':[tag_index_map.get(tag, 0) for tag in grouped_data_tags['tag'][idx]]
+        'ner_tags':[label2id.get(tag, 0) for tag in grouped_data_tags['tag'][idx]]
     }
     dataset.append(temp_dict)
 
+np.random.seed(99)
+np.random.shuffle(dataset)
+train_ratio=int(len(dataset)*0.75)
+
+train_dataset=dataset[:train_ratio]
+test_dataset=dataset[train_ratio:]
 
 # to make the dataset in format like below
 # {'id': '0',
@@ -85,12 +91,72 @@ def tokenize_and_align_labels(example):
     return tokenized_inputs
 
 # tokenize dataset
-tokenized_dataset = [tokenize_and_align_labels(example) for example in dataset]
+tokenized_train_dataset = [tokenize_and_align_labels(example) for example in train_dataset]
+tokenized_test_dataset = [tokenize_and_align_labels(example) for example in test_dataset]
 
 # tokenized dataset check
-print(tokenized_dataset[0])
 
 #create batch of examples
 data_collator=DataCollatorForTokenClassification(tokenizer=tokenizer)
 
 #evaluate
+import evaluate
+seqeval=evaluate.load("seqeval")
+example=dataset[0]
+labels=[label_list[i]for i in example[f"ner_tags"]]
+
+def compute_metrics(p):
+    predictions, labels = p
+    predictions = np.argmax(predictions, axis=2)
+
+    true_predictions = [
+        [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
+    true_labels = [
+        [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
+
+    results = seqeval.compute(predictions=true_predictions, references=true_labels)
+    return {
+        "precision": results["overall_precision"],
+        "recall": results["overall_recall"],
+        "f1": results["overall_f1"],
+        "accuracy": results["overall_accuracy"],
+    }
+
+
+
+from transformers import AutoModelForTokenClassification, TrainingArguments, Trainer
+
+model = AutoModelForTokenClassification.from_pretrained(
+    "klue/bert-base", num_labels=40, id2label=id2label, label2id=label2id
+)
+
+training_args = TrainingArguments(
+    output_dir="klubert_Fallrisk_NER",
+    learning_rate=2e-5,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    num_train_epochs=2,
+    weight_decay=0.01,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    push_to_hub=True,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train_dataset,
+    eval_dataset=tokenized_test_dataset,
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+trainer.push_to_hub()
